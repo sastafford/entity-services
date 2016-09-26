@@ -30,7 +30,6 @@ import org.springframework.batch.core.configuration.annotation.JobScope;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
 import org.springframework.batch.core.scope.context.ChunkContext;
 import org.springframework.batch.core.step.tasklet.Tasklet;
-import org.springframework.batch.core.step.tasklet.TaskletStep;
 import org.springframework.batch.item.*;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.mapping.DefaultLineMapper;
@@ -68,12 +67,14 @@ public class EntityServicesExampleConfig implements EnvironmentAware {
         JobBuilderFactory jobBuilderFactory,
         @Qualifier("importJsonData") Step importJsonData,
         @Qualifier("importCsvData") Step importCsvData,
-        @Qualifier("harmonizerStep") Step harmonizer
+        @Qualifier("harmonizerStep") Step harmonizer,
+        @Qualifier("translatorStep") Step translator
     ) {
         return jobBuilderFactory.get(JOB_NAME)
                 .start(importJsonData)
                 .next(importCsvData)
                 .next(harmonizer)
+                .next(translator)
                 .build();
     }
     
@@ -175,6 +176,45 @@ public class EntityServicesExampleConfig implements EnvironmentAware {
         };
         return stepBuilderFactory.get("harmonizer").tasklet(tasklet).build();
     }
+    
+    @Bean
+    @JobScope
+    public Step translatorStep(
+            StepBuilderFactory stepBuilderFactory,
+            DatabaseClientProvider databaseClientProvider) {
+        
+        DataMovementManager moveMgr = DataMovementManager.newInstance().withClient(databaseClientProvider.getDatabaseClient());
+        StructuredQueryBuilder qb = new StructuredQueryBuilder();
+        StructuredQueryDefinition qdef = qb.collection("race-envelopes");
+        ServerTransform ingester = new ServerTransform("translator");
+        ApplyTransformListener listener = new ApplyTransformListener().withTransform(ingester)
+                .withApplyResult(ApplyTransformListener.ApplyResult.IGNORE).onSuccess((dbClient, inPlaceBatch) -> {
+                    logger.debug("Batch transform SUCCESS");
+                }).onBatchFailure((dbClient, inPlaceBatch, throwable) -> {
+                    // logger.warn("FAILURE on batch:" + inPlaceBatch.toString()
+                    // + "\n", throwable);
+                    // throwable.printStackTrace();
+                    System.err.println(throwable.getMessage());
+                    System.err.print(String.join("\n", inPlaceBatch.getItems()) + "\n");
+                });
+        
+        Tasklet tasklet = new Tasklet() {
+            @Override
+            public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+                QueryHostBatcher queryHostBatcher = moveMgr.newQueryHostBatcher(qdef).withBatchSize(100)
+                        .withThreadCount(5).onUrisReady(listener).onQueryFailure((client3, exception) -> {
+                            logger.error("Query error");
+                        });
+    
+                JobTicket ticket = moveMgr.startJob(queryHostBatcher);
+                queryHostBatcher.awaitTermination(Long.MAX_VALUE, TimeUnit.DAYS);
+                moveMgr.stopJob(ticket);
+                return RepeatStatus.FINISHED;
+            }
+        };
+        return stepBuilderFactory.get("translator").tasklet(tasklet).build();
+    }
+    
     
     
     @Override
